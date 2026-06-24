@@ -6,11 +6,10 @@ gevent.monkey.patch_all()
 import os
 import psycopg2
 import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
 import uuid
 import json
 import io
-from flask import Flask, request, render_template_string, redirect, url_for, jsonify, session, abort, send_file, g
+from flask import Flask, request, render_template_string, redirect, url_for, jsonify, session, abort, send_file
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
 
@@ -36,34 +35,15 @@ if not DB_URL:
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "supersecret")
 
-# ----------------- DATABASE CONNECTION POOL -----------------
-# We use a ThreadedConnectionPool to eliminate the massive latency of opening 
-# a brand new TCP/SSL connection to Postgres on every single request.
-try:
-    db_pool = ThreadedConnectionPool(1, 20, DB_URL)
-except Exception as e:
-    print(f"Failed to initialize database pool: {e}")
-    db_pool = None
-
+# ----------------- DATABASE CONNECTION -----------------
+# We use standard connection handling. Render's internal network is fast enough
+# that opening/closing connections directly prevents pool exhaustion and deadlocks.
 def get_db_connection():
-    """Fetches a warm connection from the pool and attaches it to the Flask request context."""
-    if db_pool:
-        if 'db' not in g:
-            g.db = db_pool.getconn()
-        return g.db
-    # Fallback just in case
     return psycopg2.connect(DB_URL)
 
-@app.teardown_appcontext
-def close_db_connection(exception):
-    """Automatically releases the connection back to the pool at the end of the request."""
-    db = g.pop('db', None)
-    if db is not None and db_pool is not None:
-        db_pool.putconn(db)
-
 def init_db():
-    """Initializes tables. Runs outside of request context, so we manage the connection manually."""
-    conn = db_pool.getconn() if db_pool else psycopg2.connect(DB_URL)
+    """Initializes tables on startup."""
+    conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute('''
@@ -94,10 +74,7 @@ def init_db():
         conn.commit()
         cursor.close()
     finally:
-        if db_pool:
-            db_pool.putconn(conn)
-        else:
-            conn.close()
+        conn.close()
 
 # Initialize DB on startup
 init_db()
@@ -950,8 +927,8 @@ HTML_PRESENT = """
 
     <script>
         const pollId = "{{ poll.id }}";
-        // FORCE WebSocket connection to skip Render's load balancer polling lag
-        const socket = io({ transports: ['websocket'] });
+        // Let Socket.IO naturally negotiate the connection to prevent forced drops
+        const socket = io();
         
         const allQuestions = {{ questions_json | safe }};
         let currentOptions = [];
@@ -1091,8 +1068,8 @@ HTML_VOTE = """
 
     <script>
         const pollId = "{{ poll_id }}";
-        // FORCE WebSocket connection to skip Render's load balancer polling lag
-        const socket = io({ transports: ['websocket'] });
+        // Let Socket.IO naturally negotiate the connection to prevent forced drops
+        const socket = io();
         
         let currentQuestionId = null;
         let currentOptions = [];
@@ -1203,10 +1180,13 @@ def dashboard():
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cursor.execute("SELECT * FROM polls ORDER BY created_at DESC")
-    polls = cursor.fetchall()
-    cursor.close()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("SELECT * FROM polls ORDER BY created_at DESC")
+        polls = cursor.fetchall()
+        cursor.close()
+    finally:
+        conn.close()
     
     return render_template_string(HTML_ADMIN_DASHBOARD, polls=[dict(p) for p in polls])
 
@@ -1217,10 +1197,13 @@ def create_poll():
     poll_id = str(uuid.uuid4())[:8]
     
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO polls (id, title) VALUES (%s, %s)", (poll_id, title))
-    conn.commit()
-    cursor.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO polls (id, title) VALUES (%s, %s)", (poll_id, title))
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
     
     return redirect(url_for('manage_poll', poll_id=poll_id))
 
@@ -1229,27 +1212,30 @@ def manage_poll(poll_id):
     if not session.get('admin'): return redirect(url_for('login'))
     
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
-    poll = cursor.fetchone()
-    
-    if not poll:
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+        poll = cursor.fetchone()
+        
+        if not poll:
+            cursor.close()
+            return "Poll not found", 404
+            
+        cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
+        questions = cursor.fetchall()
+        
+        q_data = []
+        for q in questions:
+            q_dict = dict(q)
+            cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (q['id'],))
+            opts = cursor.fetchall()
+            q_dict['options'] = [dict(o) for o in opts]
+            q_data.append(q_dict)
+            
         cursor.close()
-        return "Poll not found", 404
-        
-    cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
-    questions = cursor.fetchall()
-    
-    q_data = []
-    for q in questions:
-        q_dict = dict(q)
-        cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (q['id'],))
-        opts = cursor.fetchall()
-        q_dict['options'] = [dict(o) for o in opts]
-        q_data.append(q_dict)
-        
-    cursor.close()
+    finally:
+        conn.close()
     
     return render_template_string(HTML_POLL_ADMIN, poll=dict(poll), questions=q_data, questions_json=json.dumps(q_data))
 
@@ -1261,36 +1247,42 @@ def add_question(poll_id):
     options = [opt for opt in options if opt.strip()]
     
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Use RETURNING id for PostgreSQL instead of lastrowid
-    cursor.execute("INSERT INTO questions (poll_id, text) VALUES (%s, %s) RETURNING id", (poll_id, text))
-    question_id = cursor.fetchone()[0]
-    
-    for opt in options:
-        cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s)", (question_id, opt))
-    
-    conn.commit()
-    cursor.close()
+    try:
+        cursor = conn.cursor()
+        
+        # Use RETURNING id for PostgreSQL instead of lastrowid
+        cursor.execute("INSERT INTO questions (poll_id, text) VALUES (%s, %s) RETURNING id", (poll_id, text))
+        question_id = cursor.fetchone()[0]
+        
+        for opt in options:
+            cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s)", (question_id, opt))
+        
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
     
     return redirect(url_for('manage_poll', poll_id=poll_id))
 
 @app.route('/activate_question/<poll_id>/<question_id>', methods=['POST'])
 def activate_question(poll_id, question_id):
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("UPDATE questions SET is_active = 0 WHERE poll_id = %s", (poll_id,))
-    cursor.execute("UPDATE questions SET is_active = 1 WHERE id = %s", (question_id,))
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM questions WHERE id = %s", (question_id,))
-    question = cursor.fetchone()
-    
-    cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (question_id,))
-    options = cursor.fetchall()
-    
-    cursor.close()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        cursor.execute("UPDATE questions SET is_active = 0 WHERE poll_id = %s", (poll_id,))
+        cursor.execute("UPDATE questions SET is_active = 1 WHERE id = %s", (question_id,))
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM questions WHERE id = %s", (question_id,))
+        question = cursor.fetchone()
+        
+        cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (question_id,))
+        options = cursor.fetchall()
+        
+        cursor.close()
+    finally:
+        conn.close()
     
     socketio.emit('question_activated', {
         'question_id': int(question_id),
@@ -1315,24 +1307,27 @@ def api_add_question(poll_id):
         return jsonify({"status": "error", "message": "Question and at least 2 options required"}), 400
     
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("INSERT INTO questions (poll_id, text) VALUES (%s, %s) RETURNING id", (poll_id, text))
-    question_id = cursor.fetchone()[0]
-    
-    option_data = []
-    for opt_text in options:
-        cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s) RETURNING id", (question_id, opt_text))
-        opt_id = cursor.fetchone()[0]
-        option_data.append({
-            "id": opt_id,
-            "question_id": question_id,
-            "text": opt_text,
-            "votes": 0
-        })
-    
-    conn.commit()
-    cursor.close()
+    try:
+        cursor = conn.cursor()
+        
+        cursor.execute("INSERT INTO questions (poll_id, text) VALUES (%s, %s) RETURNING id", (poll_id, text))
+        question_id = cursor.fetchone()[0]
+        
+        option_data = []
+        for opt_text in options:
+            cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s) RETURNING id", (question_id, opt_text))
+            opt_id = cursor.fetchone()[0]
+            option_data.append({
+                "id": opt_id,
+                "question_id": question_id,
+                "text": opt_text,
+                "votes": 0
+            })
+        
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
     
     return jsonify({
         "status": "success",
@@ -1358,48 +1353,51 @@ def api_edit_question(poll_id, question_id):
         return jsonify({"status": "error", "message": "Question text required"}), 400
     
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("UPDATE questions SET text = %s WHERE id = %s AND poll_id = %s", (text, question_id, poll_id))
-    
-    cursor.execute("SELECT id FROM options WHERE question_id = %s", (question_id,))
-    existing_opts = cursor.fetchall()
-    existing_ids = set(o['id'] for o in existing_opts)
-    
-    kept_ids = set()
-    option_data = []
-    
-    for opt in options:
-        opt_text = opt.get("text", "").strip() if isinstance(opt, dict) else str(opt).strip()
-        if not opt_text: continue
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        opt_id = opt.get("id") if isinstance(opt, dict) else None
+        cursor.execute("UPDATE questions SET text = %s WHERE id = %s AND poll_id = %s", (text, question_id, poll_id))
         
-        if opt_id and opt_id in existing_ids:
-            cursor.execute("UPDATE options SET text = %s WHERE id = %s", (opt_text, opt_id))
-            kept_ids.add(opt_id)
-            cursor.execute("SELECT * FROM options WHERE id = %s", (opt_id,))
-            o = cursor.fetchone()
-            option_data.append(dict(o))
-        else:
-            cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s) RETURNING id", (question_id, opt_text))
-            new_opt_id = cursor.fetchone()[0]
-            option_data.append({
-                "id": new_opt_id,
-                "question_id": question_id,
-                "text": opt_text,
-                "votes": 0
-            })
+        cursor.execute("SELECT id FROM options WHERE question_id = %s", (question_id,))
+        existing_opts = cursor.fetchall()
+        existing_ids = set(o['id'] for o in existing_opts)
+        
+        kept_ids = set()
+        option_data = []
+        
+        for opt in options:
+            opt_text = opt.get("text", "").strip() if isinstance(opt, dict) else str(opt).strip()
+            if not opt_text: continue
             
-    removed_ids = existing_ids - kept_ids
-    for oid in removed_ids:
-        cursor.execute("DELETE FROM options WHERE id = %s", (oid,))
-    
-    cursor.execute("SELECT is_active FROM questions WHERE id = %s", (question_id,))
-    q = cursor.fetchone()
-    
-    conn.commit()
-    cursor.close()
+            opt_id = opt.get("id") if isinstance(opt, dict) else None
+            
+            if opt_id and opt_id in existing_ids:
+                cursor.execute("UPDATE options SET text = %s WHERE id = %s", (opt_text, opt_id))
+                kept_ids.add(opt_id)
+                cursor.execute("SELECT * FROM options WHERE id = %s", (opt_id,))
+                o = cursor.fetchone()
+                option_data.append(dict(o))
+            else:
+                cursor.execute("INSERT INTO options (question_id, text) VALUES (%s, %s) RETURNING id", (question_id, opt_text))
+                new_opt_id = cursor.fetchone()[0]
+                option_data.append({
+                    "id": new_opt_id,
+                    "question_id": question_id,
+                    "text": opt_text,
+                    "votes": 0
+                })
+                
+        removed_ids = existing_ids - kept_ids
+        for oid in removed_ids:
+            cursor.execute("DELETE FROM options WHERE id = %s", (oid,))
+        
+        cursor.execute("SELECT is_active FROM questions WHERE id = %s", (question_id,))
+        q = cursor.fetchone()
+        
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
     
     return jsonify({
         "status": "success",
@@ -1418,11 +1416,14 @@ def api_delete_question(poll_id, question_id):
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
     
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM options WHERE question_id = %s", (question_id,))
-    cursor.execute("DELETE FROM questions WHERE id = %s AND poll_id = %s", (question_id, poll_id))
-    conn.commit()
-    cursor.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM options WHERE question_id = %s", (question_id,))
+        cursor.execute("DELETE FROM questions WHERE id = %s AND poll_id = %s", (question_id, poll_id))
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
     
     return jsonify({"status": "success"})
 
@@ -1464,15 +1465,18 @@ def submit_vote(poll_id):
     option_id = data.get("option_id")
     
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("UPDATE options SET votes = votes + 1 WHERE id = %s", (option_id,))
-    conn.commit()
-    
-    cursor.execute("SELECT votes FROM options WHERE id = %s", (option_id,))
-    option = cursor.fetchone()
-    
-    cursor.close()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        cursor.execute("UPDATE options SET votes = votes + 1 WHERE id = %s", (option_id,))
+        conn.commit()
+        
+        cursor.execute("SELECT votes FROM options WHERE id = %s", (option_id,))
+        option = cursor.fetchone()
+        
+        cursor.close()
+    finally:
+        conn.close()
     
     if option:
         socketio.emit('vote_update', {
@@ -1486,19 +1490,22 @@ def submit_vote(poll_id):
 @app.route('/present/<poll_id>')
 def view_present(poll_id):
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
-    poll = cursor.fetchone()
-    
-    if not poll: 
-        cursor.close()
-        return "Poll not found", 404
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-    cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
-    questions = cursor.fetchall()
-    
-    cursor.close()
+        cursor.execute("SELECT * FROM polls WHERE id = %s", (poll_id,))
+        poll = cursor.fetchone()
+        
+        if not poll: 
+            cursor.close()
+            return "Poll not found", 404
+            
+        cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
+        questions = cursor.fetchall()
+        
+        cursor.close()
+    finally:
+        conn.close()
     
     q_list = [dict(q) for q in questions]
     
@@ -1517,21 +1524,24 @@ def on_join(data):
     join_room(poll_id)
     
     conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cursor.execute("SELECT * FROM questions WHERE poll_id = %s AND is_active = 1", (poll_id,))
-    active_q = cursor.fetchone()
-    
-    if active_q:
-        cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (active_q['id'],))
-        opts = cursor.fetchall()
-        emit('question_activated', {
-            'question_id': active_q['id'],
-            'question': active_q['text'],
-            'options': [dict(o) for o in opts]
-        })
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-    cursor.close()
+        cursor.execute("SELECT * FROM questions WHERE poll_id = %s AND is_active = 1", (poll_id,))
+        active_q = cursor.fetchone()
+        
+        if active_q:
+            cursor.execute("SELECT * FROM options WHERE question_id = %s ORDER BY id ASC", (active_q['id'],))
+            opts = cursor.fetchall()
+            emit('question_activated', {
+                'question_id': active_q['id'],
+                'question': active_q['text'],
+                'options': [dict(o) for o in opts]
+            })
+            
+        cursor.close()
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
