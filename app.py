@@ -6,10 +6,11 @@ gevent.monkey.patch_all()
 import os
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 import uuid
 import json
 import io
-from flask import Flask, request, render_template_string, redirect, url_for, jsonify, session, abort, send_file
+from flask import Flask, request, render_template_string, redirect, url_for, jsonify, session, abort, send_file, g
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
 
@@ -35,49 +36,73 @@ if not DB_URL:
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "supersecret")
 
+# ----------------- DATABASE CONNECTION POOL -----------------
+# We use a ThreadedConnectionPool to eliminate the massive latency of opening 
+# a brand new TCP/SSL connection to Postgres on every single request.
+try:
+    db_pool = ThreadedConnectionPool(1, 20, DB_URL)
+except Exception as e:
+    print(f"Failed to initialize database pool: {e}")
+    db_pool = None
+
 def get_db_connection():
-    # Connect using PostgreSQL
-    conn = psycopg2.connect(DB_URL)
-    return conn
+    """Fetches a warm connection from the pool and attaches it to the Flask request context."""
+    if db_pool:
+        if 'db' not in g:
+            g.db = db_pool.getconn()
+        return g.db
+    # Fallback just in case
+    return psycopg2.connect(DB_URL)
+
+@app.teardown_appcontext
+def close_db_connection(exception):
+    """Automatically releases the connection back to the pool at the end of the request."""
+    db = g.pop('db', None)
+    if db is not None and db_pool is not None:
+        db_pool.putconn(db)
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # Note: SQLite 'INTEGER PRIMARY KEY AUTOINCREMENT' -> Postgres 'SERIAL PRIMARY KEY'
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS polls (
-            id TEXT PRIMARY KEY, 
-            title TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS questions (
-            id SERIAL PRIMARY KEY,
-            poll_id TEXT NOT NULL,
-            text TEXT NOT NULL,
-            is_active INTEGER DEFAULT 0,
-            FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS options (
-            id SERIAL PRIMARY KEY,
-            question_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            votes INTEGER DEFAULT 0,
-            FOREIGN KEY (question_id) REFERENCES questions (id) ON DELETE CASCADE
-        )
-    ''')
-    conn.commit()
-    cursor.close()
-    conn.close()
+    """Initializes tables. Runs outside of request context, so we manage the connection manually."""
+    conn = db_pool.getconn() if db_pool else psycopg2.connect(DB_URL)
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS polls (
+                id TEXT PRIMARY KEY, 
+                title TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS questions (
+                id SERIAL PRIMARY KEY,
+                poll_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                is_active INTEGER DEFAULT 0,
+                FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS options (
+                id SERIAL PRIMARY KEY,
+                question_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                votes INTEGER DEFAULT 0,
+                FOREIGN KEY (question_id) REFERENCES questions (id) ON DELETE CASCADE
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+    finally:
+        if db_pool:
+            db_pool.putconn(conn)
+        else:
+            conn.close()
 
 # Initialize DB on startup
 init_db()
 
 # ----------------- HTML TEMPLATES -----------------
-# (Templates remain identical)
 
 HTML_LOGIN = """
 <!DOCTYPE html>
@@ -925,7 +950,9 @@ HTML_PRESENT = """
 
     <script>
         const pollId = "{{ poll.id }}";
-        const socket = io();
+        // FORCE WebSocket connection to skip Render's load balancer polling lag
+        const socket = io({ transports: ['websocket'] });
+        
         const allQuestions = {{ questions_json | safe }};
         let currentOptions = [];
         let currentIndex = -1;
@@ -1064,7 +1091,9 @@ HTML_VOTE = """
 
     <script>
         const pollId = "{{ poll_id }}";
-        const socket = io();
+        // FORCE WebSocket connection to skip Render's load balancer polling lag
+        const socket = io({ transports: ['websocket'] });
+        
         let currentQuestionId = null;
         let currentOptions = [];
 
@@ -1076,8 +1105,6 @@ HTML_VOTE = """
             currentQuestionId = data.question_id;
             currentOptions = data.options;
             
-            // Namespace the localStorage key using the unique pollId to avoid clashes 
-            // from old testing sessions (especially if DB resets IDs to 1)
             const storageKey = 'voted_' + pollId + '_' + currentQuestionId;
             
             if (localStorage.getItem(storageKey)) {
@@ -1180,7 +1207,6 @@ def dashboard():
     cursor.execute("SELECT * FROM polls ORDER BY created_at DESC")
     polls = cursor.fetchall()
     cursor.close()
-    conn.close()
     
     return render_template_string(HTML_ADMIN_DASHBOARD, polls=[dict(p) for p in polls])
 
@@ -1195,7 +1221,6 @@ def create_poll():
     cursor.execute("INSERT INTO polls (id, title) VALUES (%s, %s)", (poll_id, title))
     conn.commit()
     cursor.close()
-    conn.close()
     
     return redirect(url_for('manage_poll', poll_id=poll_id))
 
@@ -1211,7 +1236,6 @@ def manage_poll(poll_id):
     
     if not poll:
         cursor.close()
-        conn.close()
         return "Poll not found", 404
         
     cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
@@ -1226,7 +1250,6 @@ def manage_poll(poll_id):
         q_data.append(q_dict)
         
     cursor.close()
-    conn.close()
     
     return render_template_string(HTML_POLL_ADMIN, poll=dict(poll), questions=q_data, questions_json=json.dumps(q_data))
 
@@ -1249,7 +1272,6 @@ def add_question(poll_id):
     
     conn.commit()
     cursor.close()
-    conn.close()
     
     return redirect(url_for('manage_poll', poll_id=poll_id))
 
@@ -1269,7 +1291,6 @@ def activate_question(poll_id, question_id):
     options = cursor.fetchall()
     
     cursor.close()
-    conn.close()
     
     socketio.emit('question_activated', {
         'question_id': int(question_id),
@@ -1312,7 +1333,6 @@ def api_add_question(poll_id):
     
     conn.commit()
     cursor.close()
-    conn.close()
     
     return jsonify({
         "status": "success",
@@ -1380,7 +1400,6 @@ def api_edit_question(poll_id, question_id):
     
     conn.commit()
     cursor.close()
-    conn.close()
     
     return jsonify({
         "status": "success",
@@ -1404,7 +1423,6 @@ def api_delete_question(poll_id, question_id):
     cursor.execute("DELETE FROM questions WHERE id = %s AND poll_id = %s", (question_id, poll_id))
     conn.commit()
     cursor.close()
-    conn.close()
     
     return jsonify({"status": "success"})
 
@@ -1455,7 +1473,6 @@ def submit_vote(poll_id):
     option = cursor.fetchone()
     
     cursor.close()
-    conn.close()
     
     if option:
         socketio.emit('vote_update', {
@@ -1476,14 +1493,12 @@ def view_present(poll_id):
     
     if not poll: 
         cursor.close()
-        conn.close()
         return "Poll not found", 404
         
     cursor.execute("SELECT * FROM questions WHERE poll_id = %s ORDER BY id ASC", (poll_id,))
     questions = cursor.fetchall()
     
     cursor.close()
-    conn.close()
     
     q_list = [dict(q) for q in questions]
     
@@ -1517,7 +1532,6 @@ def on_join(data):
         })
         
     cursor.close()
-    conn.close()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
